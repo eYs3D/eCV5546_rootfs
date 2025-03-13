@@ -1,0 +1,8 @@
+*~
+*.bak
+*.o
+rootfs.img
+disk/
+extra/
+busybox-*/
+initramfs/.tmp/
