@@ -1,0 +1,11 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=/usr/lib/aarch64-linux-gnu
+includedir=${prefix}/include
+
+Name: x264
+Description: H.264 (MPEG4 AVC) encoder library
+Version: 0.164.3108
+Libs: -L/usr/lib/aarch64-linux-gnu -lx264 
+Libs.private: -lpthread -lm -ldl
+Cflags: -I${prefix}/include -DX264_API_IMPORTS

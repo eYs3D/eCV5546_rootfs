@@ -6,7 +6,16 @@
 # $3 : NAND_PAGE_SIZE
 # $4 : NAND_PAGE_CNT
 OUT_IMG=rootfs.img
+OVERLAY=overlay
 WORK_DIR=./initramfs/disk
+
+rm -f $OUT_IMG $OVERLAY
+
+check_error() {
+	if [ $? -ne 0 ]; then
+		exit 1
+	fi
+}
 
 if [ "$1" = "EMMC" ]; then
 	
@@ -22,23 +31,40 @@ if [ "$1" = "EMMC" ]; then
 	diskdir_sz=`du -sb $WORK_DIR | cut -f1`
 	echo "rootfs total size = $diskdir_sz bytes"
 
-	rm -rf $OUT_IMG
-
-    if [ "$OVERLAYFS" == "1" ]; then
+	if [ "$OVERLAYFS" == "1" ]; then
 		#########################  squashfs fs #####################
-	    echo -e  "\E[1;33m ========make squashfs fs========== \E[0m"
-		$FAKEROOT /bin/bash -c "./tools/setting_attr.py $WORK_DIR ./initramfs/.tmp/attr.list; mksquashfs $WORK_DIR $OUT_IMG "
-    else
+		echo -e  "\E[1;33m ========make squashfs fs========== \E[0m"
+		if [ -f "./initramfs/.tmp/attr.list" ]; then
+			$FAKEROOT /bin/bash -c "./tools/setting_attr.py $WORK_DIR ./initramfs/.tmp/attr.list && mksquashfs $WORK_DIR $OUT_IMG "
+		else
+			$FAKEROOT /bin/bash -c "mksquashfs $WORK_DIR $OUT_IMG "
+		fi
+		check_error
+		OVERLAYSIZE=200
+		echo "fallocate -l ${OVERLAYSIZE}M $OVERLAY"
+		fallocate -l ${OVERLAYSIZE}M $OVERLAY
+		check_error
+		dd if=/dev/zero of=$OVERLAY bs=1M count=0 seek=${OVERLAYSIZE}
+		check_error
+		mkfs.ext4 $OVERLAY
+		check_error
+	else
 		# Assume 40% +20MB overhead for creating ext4 fs.
 		diskdir_sz=$((diskdir_sz*14/10))
 		EXT_SIZE=$((diskdir_sz/1024/1024+20))
-		$FAKEROOT /bin/bash -c "./tools/setting_attr.py $WORK_DIR ./initramfs/.tmp/attr.list; mke2fs -t ext4 -b 4096 -d $WORK_DIR $OUT_IMG $((EXT_SIZE))M"
+		if [ -f "./initramfs/.tmp/attr.list" ]; then
+			$FAKEROOT /bin/bash -c "./tools/setting_attr.py $WORK_DIR ./initramfs/.tmp/attr.list && mke2fs -t ext4 -b 4096 -d $WORK_DIR $OUT_IMG $((EXT_SIZE))M"
+		else
+			$FAKEROOT /bin/bash -c "mke2fs -t ext4 -b 4096 -d $WORK_DIR $OUT_IMG $((EXT_SIZE))M"
+		fi
+		check_error
 		#########################  ext4 fs #####################
 		echo -e  "\E[1;33m ========make ext4 fs========== \E[0m"
 		# Resize to 10% more than minimum.
 		minimum_sz=`$RESIZE -P $OUT_IMG | cut -d: -f2`
 		minimum_sz=$((minimum_sz*11/10+1))
 		$RESIZE $OUT_IMG $minimum_sz
+		check_error
 	fi
 
 elif [ "$1" = "SDCARD" ]; then
@@ -52,13 +78,15 @@ elif [ "$1" = "NAND" -o "$1" = "PNAND" ]; then
 #                      use the ubi cmd to write rootfs into nand in ISP, need add ubi config in uboot; used it!!!
 #mkfs.ubifs+ubinize+nand write: the rootfs size is fixed in ubi.cfg that used in ubinize function. this
 #                               can use the nand write cmd to write dat into nand, no need do something in uboot.
-	echo -e  "\E[1;33m ========make ubi fs========== \E[0m"
-	MKFS_UBIFS="fakeroot -- mkfs.ubifs"
-	UBINIZE=./tools/ubinize
-	UBI_CFG=./ubi.cfg
 
 	NAND_PAGESIZE=$(($3*1024))
 	NAND_BLK_PAGESIZE=$4
+	NAND_BLK_SIZE=$NAND_BLK_PAGESIZE*$NAND_PAGESIZE  # size = blockcnt*2048
+	UBINIZE=./tools/ubinize
+	UBI_CFG=./ubi.cfg
+
+	MKFS_UBIFS="fakeroot -- mkfs.ubifs"
+
 	MAX_ERASE_BLK_CNT=$((($2*1024)/($3*$4)/1024*1015))
 	echo " NAND_PAGESIZE=$NAND_PAGESIZE"
 	echo " NAND_BLK_PAGESIZE=$NAND_BLK_PAGESIZE"
@@ -71,12 +99,29 @@ elif [ "$1" = "NAND" -o "$1" = "PNAND" ]; then
 		exit 1
 	fi
 
-	$MKFS_UBIFS -r $WORK_DIR -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o $OUT_IMG
+	if [ "$OVERLAYFS" == "1" ] && [ "$1" = "NAND" ]; then
+		#########################  squashfs fs #####################
+		echo -e  "\E[1;33m ========make squashfs fs========== \E[0m"
+		echo "$FAKEROOT /bin/bash -c \"mksquashfs $WORK_DIR $OUT_IMG -all-root\""
+		$FAKEROOT /bin/bash -c "mksquashfs $WORK_DIR $OUT_IMG -all-root"
+		check_error
+		echo -e  "\E[1;33m ========make ubi fs========== \E[0m"
+		mkdir -p empty/upper
+		mkdir -p empty/work
+		echo "$MKFS_UBIFS -r empty -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o $OVERLAY"
+		$MKFS_UBIFS -r empty -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o $OVERLAY
+		check_error
+		rm -rf empty
+	else
+		echo -e  "\E[1;33m ========make ubi fs========== \E[0m"
+		echo "$MKFS_UBIFS -r $WORK_DIR -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o $OUT_IMG"
+		$MKFS_UBIFS -r $WORK_DIR -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o $OUT_IMG
+		check_error
+	fi
 
 	if [ "$1" = "ZEBU_PNAND" ]; then #mkfs.ubifs+ubinize is used to paranand boot in zebu
 
 		NAND_ROOTFS_SIZE=100MiB
-		NAND_BLK_SIZE=$NAND_BLK_PAGESIZE*$NAND_PAGESIZE  # size = blockcnt*2048
 		## rootfs size need to smaller than rootfs partition size set in isp
 		if [ 1020 -eq $MAX_ERASE_BLK_CNT ];then
 			NAND_ROOTFS_SIZE=100MiB
@@ -97,7 +142,9 @@ elif [ "$1" = "NAND" -o "$1" = "PNAND" ]; then
 
 		echo -e  "\E[1;33m ========rootfs = $NAND_ROOTFS_SIZE  pagesize=$NAND_PAGESIZE========== \E[0m"
 		$MKFS_UBIFS -r $WORK_DIR -m $NAND_PAGESIZE -e $(($NAND_LOGIC_REASE_SIZE)) -c $MAX_ERASE_BLK_CNT -F -o nand.img
+		check_error
 		$UBINIZE -v -o $OUT_IMG -m $NAND_PAGESIZE -p $(($NAND_BLK_SIZE/1024))KiB $UBI_CFG
+		check_error
 		rm -rf nand.img
 	fi
 
@@ -187,4 +234,5 @@ else
 	fi
 
 	$MKSQFS $WORK_DIR $OUT_IMG -all-root -noappend $MKSQFS_COMPOPT
+	check_error
 fi

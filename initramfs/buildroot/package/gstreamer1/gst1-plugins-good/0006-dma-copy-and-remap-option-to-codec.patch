@@ -1,6 +1,6 @@
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.c
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.c	2024-01-25 02:21:13.000000000 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.c	2024-12-13 15:26:03.054383112 +0800
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2bufferpool.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2bufferpool.c	2024-01-25 02:21:13.000000000 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.c	2025-02-13 13:32:29.613079098 +0800
 @@ -134,6 +134,91 @@
    }
  }
@@ -103,23 +103,112 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.c gst-plugins-goo
  
      gst_video_frame_unmap (&src_frame);
      gst_video_frame_unmap (&dest_frame);
-@@ -1321,6 +1407,15 @@
+@@ -1321,6 +1407,16 @@
        gst_memory_resize (group->mem[i], 0, obj->plane_size[i]);
    }
  
-+  {
++  if(obj->use_dma_copy){
 +    GstV4L2BufferPoolMeta *meta = (GstV4L2BufferPoolMeta *) gst_buffer_add_meta (outbuf,
 +      GST_V4L2_BUFFER_POOL_META_INFO, NULL);
-+    g_assert (meta != NULL);
 +
-+    meta->video_fd = obj->video_fd;
-+    meta->buf_idx = group->buffer.index;
++    if(meta){
++      meta->video_fd = obj->video_fd;
++      meta->buf_idx = group->buffer.index;
++    }
 +  }
 +
    /* Ignore timestamp and field for OUTPUT device */
    if (V4L2_TYPE_IS_OUTPUT (obj->type))
      goto done;
-@@ -2315,3 +2410,59 @@
+@@ -1872,6 +1968,24 @@
+ }
+ 
+ /**
++ * For disable_capture_copy use
++ */
++typedef struct {
++  GstBuffer *buf;
++  GstBufferPool *bpool;
++  GstMapInfo map;
++} NotifyData;
++
++static void _notify( gpointer user_data){
++  NotifyData *n_data = (NotifyData*)user_data;
++
++  gst_buffer_unmap(n_data->buf, &n_data->map);
++  gst_v4l2_buffer_pool_complete_release_buffer(n_data->bpool, n_data->buf, FALSE);
++
++  g_free(n_data);
++}
++
++/**
+  * gst_v4l2_buffer_pool_process:
+  * @bpool: a #GstBufferPool
+  * @buf: a #GstBuffer, maybe be replaced
+@@ -1953,14 +2067,16 @@
+                   goto done;
+               }
+ 
+-              /* copy the buffer */
+-              copy = gst_buffer_copy_region (*buf,
+-                  GST_BUFFER_COPY_ALL | GST_BUFFER_COPY_DEEP, 0, -1);
+-              GST_LOG_OBJECT (pool, "copy buffer %p->%p", *buf, copy);
+-
+-              /* and requeue so that we can continue capturing */
+-              gst_buffer_unref (*buf);
+-              *buf = copy;
++              if(!obj->disable_capture_copy){
++                /* copy the buffer */
++                copy = gst_buffer_copy_region (*buf,
++                    GST_BUFFER_COPY_ALL | GST_BUFFER_COPY_DEEP, 0, -1);
++                GST_LOG_OBJECT (pool, "copy buffer %p->%p", *buf, copy);
++
++                /* and requeue so that we can continue capturing */
++                gst_buffer_unref (*buf);
++                *buf = copy;
++              }
+             }
+ 
+             ret = GST_FLOW_OK;
+@@ -1984,10 +2100,34 @@
+             }
+           }
+ 
+-          ret = gst_v4l2_buffer_pool_copy_buffer (pool, *buf, tmp);
++          if(!obj->disable_capture_copy){
++            ret = gst_v4l2_buffer_pool_copy_buffer (pool, *buf, tmp);
++
++            /* an queue the buffer again after the copy */
++            gst_v4l2_buffer_pool_complete_release_buffer (bpool, tmp, FALSE);
++          }
++          else{
++            NotifyData *udata = g_new0 (NotifyData, 1);
++
++            udata->buf = tmp;
++            udata->bpool = bpool;
++
++            GST_DEBUG_OBJECT (pool, "use dma buffer");
++
++            if (!gst_buffer_map (tmp, &udata->map, GST_MAP_READ))
++              goto copy_failed;
+ 
+-          /* an queue the buffer again after the copy */
+-          gst_v4l2_buffer_pool_complete_release_buffer (bpool, tmp, FALSE);
++            GstBuffer *dest = gst_buffer_new_wrapped_full(0,
++                udata->map.data, udata->map.size, 0, udata->map.size, udata, _notify);
++
++            gst_buffer_resize (dest, 0, gst_buffer_get_size (tmp));
++
++            gst_buffer_copy_into (dest, tmp,
++                GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS, 0, -1);
++
++            gst_buffer_unref (*buf);
++           *buf = dest;
++          }
+ 
+           if (ret != GST_FLOW_OK)
+             goto copy_failed;
+@@ -2315,3 +2455,59 @@
  {
    gst_v4l2_object_subscribe_event (pool->obj, V4L2_EVENT_SOURCE_CHANGE);
  }
@@ -179,9 +268,9 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.c gst-plugins-goo
 +}
 +
 +
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.h gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.h
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.h	2024-01-25 02:21:13.000000000 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.h	2024-12-13 15:26:10.149862595 +0800
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2bufferpool.h gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.h
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2bufferpool.h	2024-01-25 02:21:13.000000000 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2bufferpool.h	2025-02-12 16:53:59.348053136 +0800
 @@ -36,6 +36,24 @@
  
  G_BEGIN_DECLS
@@ -207,9 +296,475 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2bufferpool.h gst-plugins-goo
  #define GST_TYPE_V4L2_BUFFER_POOL      (gst_v4l2_buffer_pool_get_type())
  #define GST_IS_V4L2_BUFFER_POOL(obj)   (G_TYPE_CHECK_INSTANCE_TYPE ((obj), GST_TYPE_V4L2_BUFFER_POOL))
  #define GST_V4L2_BUFFER_POOL(obj)      (G_TYPE_CHECK_INSTANCE_CAST ((obj), GST_TYPE_V4L2_BUFFER_POOL, GstV4l2BufferPool))
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.c
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.c	2024-12-13 15:23:06.601401623 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.c	2024-12-13 15:27:21.640348085 +0800
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264codec.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264codec.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264codec.c	2025-02-12 16:50:53.372630078 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264codec.c	2025-03-21 11:01:34.481659709 +0800
+@@ -181,9 +181,9 @@
+ {
+ 
+   /*[Wang.Zhou]Fixed encode failed*/
+-  if(v4l2_level < V4L2_MPEG_VIDEO_H264_LEVEL_4_0){
+-    GST_WARNING ("Use V4L2_MPEG_VIDEO_H264_LEVEL_4_0 when %i unsupport", v4l2_level);
+-    v4l2_level = V4L2_MPEG_VIDEO_H264_LEVEL_4_0;
++  if(v4l2_level < V4L2_MPEG_VIDEO_H264_LEVEL_4_1){
++    GST_WARNING ("Use V4L2_MPEG_VIDEO_H264_LEVEL_4_1 when %i unsupport", v4l2_level);
++    v4l2_level = V4L2_MPEG_VIDEO_H264_LEVEL_4_1;
+   }
+ 
+   switch (v4l2_level) {
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264enc.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264enc.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264enc.c	2025-02-12 16:50:44.228658451 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264enc.c	2025-03-21 15:48:46.840348925 +0800
+@@ -62,18 +62,7 @@
+   PROP_P_FRAME_QP,
+   PROP_B_FRAME_QP,
+ 
+-  PROP_LOOP_FILTER_MODE,
+-  PROP_LOOP_FILTER_ALPHA,
+-  PROP_LOOP_FILTER_BETA,
+-
+-  PROP_8x8_TRANSFORM,
+   PROP_CPB_SIZE,
+-  PROP_ENTROPY_MODE, //CABAC
+-
+-  PROP_VUI_EXT_SAR_HEIGHT,
+-  PROP_VUI_EXT_SAR_WIDTH,
+-  PROP_VUI_SAR_ENABLED,
+-  PROP_VUI_SAR_IDC,
+ 
+   PROP_FROCE_KEY,
+   PROP_IDR_DHR,
+@@ -99,9 +88,9 @@
+   	{GST_V4L2_H264_ENC_RC_MODE_VBR,  "Variable bitrate", "vbr"},
+     {GST_V4L2_H264_ENC_RC_MODE_CBR,  "Constant bitrate", "cbr"},
+     {GST_V4L2_H264_ENC_RC_MODE_CQ,   "Constant QP", "cq"},
+-    {GST_V4L2_H264_ENC_RC_MODE_CVBR, "Constrained VBR mode", "cvbr"},
+-    {GST_V4L2_H264_ENC_RC_MODE_ABR,  "Average bitrate mode", "abr"},
+-    {GST_V4L2_H264_ENC_RC_MODE_CRF,  "Constant rate factor mode", "crf"},
++    //{GST_V4L2_H264_ENC_RC_MODE_CVBR, "Constrained VBR mode", "cvbr"},
++    //{GST_V4L2_H264_ENC_RC_MODE_ABR,  "Average bitrate mode", "abr"},
++    //{GST_V4L2_H264_ENC_RC_MODE_CRF,  "Constant rate factor mode", "crf"},
+     {0, NULL, NULL}
+   };
+ 
+@@ -115,29 +104,21 @@
+ #define GST_V4L2_H264_ENC_RC_MODE_DEFAULT 				GST_V4L2_H264_ENC_RC_MODE_VBR
+ #define GST_V4L2_H264_ENC_BITRATE_DEFAULT 				(1024*1024)
+ #define GST_V4L2_H264_ENC_QP_DEFAULT 					24
+-#define GST_V4L2_H264_ENC_RF_DEFAULT 					21
+ #define GST_V4L2_H264_ENC_QP_MIN_DEFAULT 				0
+ #define GST_V4L2_H264_ENC_QP_MAX_DEFAULT 				51
+ #define GST_V4L2_H264_ENC_QP_I_DEFAULT 					26
+ #define GST_V4L2_H264_ENC_QP_P_DEFAULT 					26
+-#define GST_V4L2_H264_ENC_QP_B_DEFAULT 					26
+ #define GST_V4L2_H264_ENC_GOP_SIZE_DEFAULT 				15
+-#define GST_V4L2_H264_ENC_B_FRAMES_DEFAULT 				(0)
+-#define GST_V4L2_H264_ENC_CABAC_DEFAULT 				FALSE
+-#define GST_V4L2_H264_ENC_8x8_EN_DEFAULT 				FALSE
+-#define GST_V4L2_H264_ENC_FILTER_MODE_DEFAULT 			1
+-#define GST_V4L2_H264_ENC_FILTER_ALPHA_DEFAULT 			0
+-#define GST_V4L2_H264_ENC_FILTER_BETA_DEFAULT 			0
+ #define GST_V4L2_H264_ENC_REF_NUMBER_DEFAULT 			1
+-#define GST_V4L2_H264_ENC_VUI_EXT_SAR_HEIGHT_DEFAULT 	0
+-#define GST_V4L2_H264_ENC_VUI_EXT_SAR_WIDTH_DEFAULT 	0
+-#define GST_V4L2_H264_ENC_VUI_SAR_ENABLED_DEFAULT 		FALSE
+-#define GST_V4L2_H264_ENC_VUI_SAR_IDC_DEFAULT 			0
++#define GST_V4L2_H264_ENC_CPB_SIZE_L4_1 			    67500000 //sync to level 4.1
++
+ 
+ ///
+ #define MIN(a,b) (((a)>(b))?(b):(a))
+ #define MAX(a,b) (((a)>(b))?(a):(b))
+ 
++static int v4l2_h264_enc_set_ctrl(int fd, int id, int value);
++
+ #define gst_v4l2_h264_enc_parent_class parent_class
+ G_DEFINE_TYPE (GstV4l2H264Enc, gst_v4l2_h264_enc, GST_TYPE_V4L2_VIDEO_ENC);
+ 
+@@ -151,6 +132,8 @@
+   switch(prop_id){
+   	case PROP_BITRATE:
+ 	  self->bitrate = g_value_get_uint (value);
++      v4l2_h264_enc_set_ctrl(video_enc->v4l2output->video_fd
++	  								, V4L2_CID_MPEG_VIDEO_BITRATE, self->bitrate);
+ 	  break;
+ 	case PROP_RC_MODE:
+ 	  self->rc_mode = g_value_get_enum (value);
+@@ -158,9 +141,6 @@
+ 	case PROP_GOP_SIZE:
+       self->gop_size = g_value_get_int (value);
+ 	  break;
+-	case PROP_B_FRAMES:
+-	  self->bframes = g_value_get_uint (value);
+-	  break;
+ 	case PROP_QP:
+ 	  self->qp = g_value_get_uint (value);
+ 	  break;
+@@ -176,9 +156,6 @@
+ 	case PROP_P_FRAME_QP:
+ 	  self->qp_p = g_value_get_uint (value);
+ 	  break;
+-	case PROP_B_FRAME_QP:
+-	  self->qp_b = g_value_get_uint (value);
+-	  break;
+ 	case PROP_FROCE_KEY:
+       if(g_value_get_boolean (value))
+ 	    v4l2_h264_enc_set_ctrl(video_enc->v4l2output->video_fd
+@@ -187,33 +164,9 @@
+     case PROP_IDR_DHR:
+ 	  self->idr_hdr = g_value_get_boolean (value);
+ 	  break;
+-	case PROP_LOOP_FILTER_ALPHA:
+-	  self->tc_offset = g_value_get_int (value);
+-	  break;
+-    case PROP_LOOP_FILTER_BETA:
+-	  self->beta_offset = g_value_get_int (value);
+-	  break;
+-  	case PROP_8x8_TRANSFORM:
+-	  self->transform8x8_en = g_value_get_boolean (value);
+-	  break;
+     case PROP_CPB_SIZE:
+       self->cpb_size = g_value_get_int (value);
+ 	  break;
+-    case PROP_ENTROPY_MODE:
+-	  self->cabac_en = g_value_get_boolean (value);
+-	  break;
+-    case PROP_VUI_EXT_SAR_HEIGHT:
+-	  self->vui_sar_width = g_value_get_uint (value);
+-	  break;
+-    case PROP_VUI_EXT_SAR_WIDTH:
+-	  self->vui_sar_height = g_value_get_uint (value);
+-	  break;
+-    case PROP_VUI_SAR_ENABLED:
+-	  self->vui_sar_en = g_value_get_boolean(value);
+-	  break;
+-    case PROP_VUI_SAR_IDC:
+-	  self->vui_sar_height = g_value_get_uint (value);
+-	  break;
+ 	default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -238,9 +191,6 @@
+ 	case PROP_GOP_SIZE:
+ 	  g_value_set_int (value, self->gop_size);
+ 	  break;
+-	case PROP_B_FRAMES:
+-	  g_value_set_uint (value, self->bframes);
+-	  break;
+ 	case PROP_QP:
+ 	  g_value_set_uint (value, self->qp);
+ 	  break;
+@@ -256,36 +206,9 @@
+ 	case PROP_P_FRAME_QP:
+ 	  g_value_set_uint (value, self->qp_p);
+ 	  break;
+-	case PROP_B_FRAME_QP:
+-      g_value_set_uint (value, self->qp_b);
+-	  break;
+-	case PROP_LOOP_FILTER_ALPHA:
+-	  g_value_set_int (value, self->tc_offset);
+-	  break;
+-    case PROP_LOOP_FILTER_BETA:
+-	  g_value_set_int (value, self->beta_offset);
+-	  break;
+-  	case PROP_8x8_TRANSFORM:
+- 	  g_value_set_boolean (value, self->transform8x8_en);
+-	  break;
+     case PROP_CPB_SIZE:
+ 	  g_value_set_uint (value, self->cpb_size);
+ 	  break;
+-    case PROP_ENTROPY_MODE:
+-	  g_value_set_boolean (value, self->cabac_en);
+-	  break;
+-    case PROP_VUI_EXT_SAR_HEIGHT:
+-	  g_value_set_uint (value, self->vui_sar_height);
+-	  break;
+-    case PROP_VUI_EXT_SAR_WIDTH:
+-	  g_value_set_uint (value, self->vui_sar_width);
+-	  break;
+-    case PROP_VUI_SAR_ENABLED:
+-	  g_value_set_boolean (value, self->vui_sar_en);
+-	  break;
+-    case PROP_VUI_SAR_IDC:
+-	  g_value_set_uint (value, self->vui_sar_idc);
+-	  break;
+ 	default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -300,32 +223,19 @@
+   self->bitrate = GST_V4L2_H264_ENC_BITRATE_DEFAULT;
+   self->rc_mode = GST_V4L2_H264_ENC_RC_MODE_DEFAULT;
+ 
+-  self->cabac_en = GST_V4L2_H264_ENC_CABAC_DEFAULT;
+-  self->transform8x8_en = GST_V4L2_H264_ENC_8x8_EN_DEFAULT;
+-
+-  self->bframes = GST_V4L2_H264_ENC_B_FRAMES_DEFAULT;
+   self->gop_size = GST_V4L2_H264_ENC_GOP_SIZE_DEFAULT;
+ 
+   self->qp = GST_V4L2_H264_ENC_QP_DEFAULT;
+-  self->rf = GST_V4L2_H264_ENC_RF_DEFAULT;
+   self->qp_min = GST_V4L2_H264_ENC_QP_MIN_DEFAULT;
+   self->qp_max = GST_V4L2_H264_ENC_QP_MAX_DEFAULT;
+   self->qp_i = GST_V4L2_H264_ENC_QP_I_DEFAULT;
+   self->qp_p = GST_V4L2_H264_ENC_QP_P_DEFAULT;
+-  self->qp_b = GST_V4L2_H264_ENC_QP_B_DEFAULT;
+-
+-  self->f_mode = GST_V4L2_H264_ENC_FILTER_MODE_DEFAULT;
+-  self->tc_offset = GST_V4L2_H264_ENC_FILTER_ALPHA_DEFAULT;
+-  self->beta_offset = GST_V4L2_H264_ENC_FILTER_BETA_DEFAULT;
+ 
+   self->ref_num = GST_V4L2_H264_ENC_REF_NUMBER_DEFAULT;
+ 
+-  self->vui_sar_width = GST_V4L2_H264_ENC_VUI_EXT_SAR_HEIGHT_DEFAULT;
+-  self->vui_sar_height = GST_V4L2_H264_ENC_VUI_EXT_SAR_WIDTH_DEFAULT;
+-  self->vui_sar_en = GST_V4L2_H264_ENC_VUI_SAR_ENABLED_DEFAULT;
+-  self->vui_sar_idc = GST_V4L2_H264_ENC_VUI_SAR_IDC_DEFAULT;
+-
+   self->idr_hdr = 0;
++
++  self->cpb_size = GST_V4L2_H264_ENC_CPB_SIZE_L4_1;
+ }
+ 
+ static void
+@@ -358,9 +268,8 @@
+   gobject_class->get_property =
+       GST_DEBUG_FUNCPTR (gst_v4l2_h264_enc_get_property);
+ 
+-
+   g_object_class_install_property (gobject_class, PROP_BITRATE,
+-		g_param_spec_uint ("bitrate", "Bitrate", "Bitrate in kbit/sec", 1,
++		g_param_spec_uint ("bitrate", "Bitrate", "Bitrate (in bits per second)", 1,
+ 			G_MAXUINT, GST_V4L2_H264_ENC_BITRATE_DEFAULT,
+ 			(GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+   g_object_class_install_property (gobject_class, PROP_RC_MODE,
+@@ -375,12 +284,6 @@
+             0, G_MAXINT, GST_V4L2_H264_ENC_GOP_SIZE_DEFAULT,
+             (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+                 G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_B_FRAMES,
+-	    g_param_spec_uint ("bframes", "B frames",
+-	        "Number of B-frames between I and P", 0, G_MAXUINT,
+-	        GST_V4L2_H264_ENC_B_FRAMES_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+   g_object_class_install_property (gobject_class, PROP_QP,
+ 	    g_param_spec_uint ("qp", "Quantization parameter",
+ 	        "The encoding quality", 0, 51,
+@@ -411,12 +314,6 @@
+             GST_V4L2_H264_ENC_QP_P_DEFAULT,
+             (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+                 G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_B_FRAME_QP,
+-        g_param_spec_uint ("qp-b", "QP B",
+-            "QP applied to B frames", 0, 51,
+-            GST_V4L2_H264_ENC_QP_B_DEFAULT,
+-            (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-                G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+   g_object_class_install_property (gobject_class, PROP_FROCE_KEY,
+         g_param_spec_boolean ("froce-key", "Froce key",
+             "Froce encode from key frame",
+@@ -427,59 +324,10 @@
+             "Add idr to each key frame",
+             FALSE,
+             G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
+-  g_object_class_install_property (gobject_class, PROP_ENTROPY_MODE,
+-        g_param_spec_boolean ("cabac", "Use CABAC",
+-            "Enable CABAC entropy coding",
+-            GST_V4L2_H264_ENC_CABAC_DEFAULT,
+-            (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-                G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_ENTROPY_MODE,
+-        g_param_spec_boolean ("transform8x8", "Transform8x8",
+-            "Adaptive spatial transform size",
+-            GST_V4L2_H264_ENC_8x8_EN_DEFAULT,
+-            (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-                G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_LOOP_FILTER_ALPHA,
+-	    g_param_spec_int ("alpha", "Filter alpha",
+-	        "The h264 loop filter alpha", 0, G_MAXINT,
+-	        GST_V4L2_H264_ENC_FILTER_ALPHA_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_LOOP_FILTER_BETA,
+-	    g_param_spec_int ("beta", "Filter bata",
+-	        "The h264 loop filter beta", 0, G_MAXINT,
+-	        GST_V4L2_H264_ENC_FILTER_BETA_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_B_FRAMES,
+-	    g_param_spec_uint ("ref-num", "Refernce number",
+-	        "The refernece number P frames", 1, G_MAXUINT,
+-	        GST_V4L2_H264_ENC_REF_NUMBER_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  ///
+-  g_object_class_install_property (gobject_class, PROP_VUI_EXT_SAR_WIDTH,
+-	    g_param_spec_uint ("sar-width", "Sar width",
+-	        "The vui extern sar width", 0, G_MAXUINT,
+-	        GST_V4L2_H264_ENC_VUI_EXT_SAR_WIDTH_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_VUI_EXT_SAR_HEIGHT,
+-	    g_param_spec_uint ("sar-height", "sar height",
+-	        "The vui extern sar height", 0, G_MAXUINT,
+-	        GST_V4L2_H264_ENC_VUI_EXT_SAR_HEIGHT_DEFAULT,
+-	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_VUI_SAR_ENABLED,
+-        g_param_spec_boolean ("sar", "Use SAR",
+-            "Enable VUI SAR",
+-            GST_V4L2_H264_ENC_VUI_SAR_ENABLED_DEFAULT,
+-            (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+-                G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (gobject_class, PROP_VUI_SAR_IDC,
+-	    g_param_spec_uint ("sar-idc", "SAR idc",
+-	        "The vui sar idc", 0, 2,
+-	        GST_V4L2_H264_ENC_VUI_SAR_IDC_DEFAULT,
++  g_object_class_install_property (gobject_class, PROP_CPB_SIZE,
++	    g_param_spec_uint ("cpb-size", "CPB Size",
++	        "The h264 cpb size", 175000, 240000000,
++	        GST_V4L2_H264_ENC_CPB_SIZE_L4_1,
+ 	        (GParamFlags) (GST_PARAM_CONDITIONALLY_AVAILABLE |
+ 	            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+ 
+@@ -526,9 +374,6 @@
+   if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_GOP_SIZE, self->gop_size) < 0){
+ 	GST_ERROR_OBJECT(self, "Set gop size %d failed!", self->gop_size);
+   }
+-  if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_B_FRAMES, self->bframes) < 0 ){
+-	GST_ERROR_OBJECT(self, "Set bframes %d failed!", self->bframes);
+-  }
+   if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_REF_NUMBER_FOR_PFRAMES, self->ref_num) < 0){
+ 	GST_ERROR_OBJECT(self, "Set refernece number %d failed!", self->ref_num);
+   }
+@@ -550,21 +395,18 @@
+     if(self->qp_p > self->qp_max) self->qp_p = self->qp_max;
+     else if(self->qp_p < self->qp_min) self->qp_p = self->qp_min;
+ 
+-    if(self->qp_b > self->qp_max) self->qp_b = self->qp_max;
+-    else if(self->qp_b < self->qp_min) self->qp_b = self->qp_min;
+-
+     if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, self->qp_max) < 0){
+   	  GST_ERROR_OBJECT(self, "Set max qp %d failed!", self->qp_max);
+     }
+     if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, self->qp_min) < 0){
+   	  GST_ERROR_OBJECT(self, "Set min qp %d failed!", self->qp_min);
+     }
+-	if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_BITRATE, self->bitrate) < 0){
++	if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_BITRATE, self->bitrate - rand() % 131) < 0){
+   	  GST_ERROR_OBJECT(self, "Set bitrate %d failed!", self->bitrate);
+     }
+   }
+   else if(self->rc_mode == GST_V4L2_H264_ENC_RC_MODE_CBR){
+-	if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_BITRATE, self->bitrate) < 0){
++	if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_BITRATE, self->bitrate - rand() % 131) < 0){
+ 	  GST_ERROR_OBJECT(self, "Set bitrate %d failed!", self->bitrate);
+     }
+   }
+@@ -574,63 +416,17 @@
+   	}
+   }
+   else if(self->rc_mode == GST_V4L2_H264_ENC_RC_MODE_CVBR){
+-	GST_ERROR_OBJECT(self, "CVBR mode not support!", self->rf);
++	GST_ERROR_OBJECT(self, "CVBR mode not support!");
+ 
+   }
+   else if(self->rc_mode == GST_V4L2_H264_ENC_RC_MODE_ABR){
+-	GST_ERROR_OBJECT(self, "ABR mode not support!", self->rf);
++	GST_ERROR_OBJECT(self, "ABR mode not support!");
+   }
+   else if(self->rc_mode == GST_V4L2_H264_ENC_RC_MODE_CRF){
+-	GST_ERROR_OBJECT(self, "CRF mode not support!", self->rf);
++	GST_ERROR_OBJECT(self, "CRF mode not support!");
+   }
+-  //FIXME:The following options not be verified!!!
+-  if(self->cabac_en != GST_V4L2_H264_ENC_CABAC_DEFAULT){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, self->cabac_en) < 0){
+-	  GST_ERROR_OBJECT(self, "Set CABAC ehable %d failed!", self->cabac_en);
+-    }
+-  }
+-  /*if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE, self->cpb_size) < 0){
++  if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE, self->cpb_size) < 0){
+ 	GST_ERROR_OBJECT(self, "Set cpb size %d failed!", self->cpb_size);
+-  }*/
+-  if(self->transform8x8_en){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_8X8_TRANSFORM, self->transform8x8_en) < 0){
+-	  GST_ERROR_OBJECT(self, "Set transform8x8_en %d failed!", self->transform8x8_en);
+-    }
+-  }
+-  if(self->vui_sar_en){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_ENABLE, self->vui_sar_en) < 0){
+-	  GST_ERROR_OBJECT(self, "Set sar enable %d failed!", self->vui_sar_en);
+-    }
+-  }
+-  if(self->vui_sar_idc != GST_V4L2_H264_ENC_VUI_SAR_IDC_DEFAULT){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_IDC, self->vui_sar_idc) < 0){
+-	  GST_ERROR_OBJECT(self, "Set sar idc %d failed!", self->vui_sar_idc);
+-    }
+-  }
+-  if(self->vui_sar_width){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_HEIGHT, self->vui_sar_width) < 0){
+-	  GST_ERROR_OBJECT(self, "Set sar width %d failed!", self->vui_sar_width);
+-    }
+-  }
+-  if(self->vui_sar_height){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_WIDTH, self->vui_sar_height) < 0){
+-	  GST_ERROR_OBJECT(self, "Set sar height %d failed!", self->vui_sar_height);
+-    }
+-  }
+-  if(self->f_mode != GST_V4L2_H264_ENC_FILTER_MODE_DEFAULT){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE, self->f_mode) < 0){
+-	  GST_ERROR_OBJECT(self, "Set loop filter mode %d failed!", self->f_mode);
+-    }
+-  }
+-  if(self->tc_offset){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_ALPHA, self->tc_offset) < 0){
+-	  GST_ERROR_OBJECT(self, "Set filter alpha %d failed!", self->tc_offset);
+-    }
+-  }
+-  if(self->beta_offset){
+-    if(v4l2_h264_enc_set_ctrl(v4l2object->video_fd, V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_BETA, self->beta_offset) < 0){
+-	  GST_ERROR_OBJECT(self, "Set filter beta %d failed!", self->beta_offset);
+-    }
+   }
+ 
+   return TRUE;
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264enc.h gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264enc.h
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2h264enc.h	2025-02-12 16:50:44.228658451 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2h264enc.h	2025-03-26 14:46:43.195421296 +0800
+@@ -52,29 +52,16 @@
+   guint rc_mode;
+   guint bitrate;
+   gint  gop_size;
+-  guint bframes;
+ 
+   guint qp;
+-  guint rf;
+ 
+   guint qp_min;
+   guint qp_max;
+   guint qp_i;
+   guint qp_p;
+-  guint qp_b;
+ 
+   gboolean cabac_en;
+   guint cpb_size;
+-  gboolean transform8x8_en;
+-
+-  gboolean vui_sar_en;
+-  guint vui_sar_idc;
+-  guint vui_sar_width;
+-  guint vui_sar_height;
+-
+-  gint f_mode;
+-  gint tc_offset;
+-  gint beta_offset;
+ 
+   guint ref_num;
+ 
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2object.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2object.c	2025-02-12 16:50:58.364614595 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.c	2025-02-12 16:53:59.348053136 +0800
 @@ -468,6 +468,12 @@
        g_param_spec_boxed ("extra-controls", "Extra Controls",
            "Extra v4l2 controls (CIDs) for the device",
@@ -260,15 +815,6 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.c gst-plugins-good-1.
    	&& !GST_VIDEO_INFO_IS_YUV (&info)){
    	width = GST_ROUND_UP_16 (width);
      height = GST_ROUND_UP_16 (height);
-@@ -3841,7 +3854,7 @@
-         stride = GST_VIDEO_TILE_X_TILES (stride) *
-             GST_VIDEO_FORMAT_INFO_TILE_STRIDE (info.finfo, i);
- 
--      format.fmt.pix_mp.plane_fmt[i].bytesperline = stride;
-+//      format.fmt.pix_mp.plane_fmt[i].bytesperline = stride;
-     }
- 
-     if (GST_VIDEO_INFO_FORMAT (&info) == GST_VIDEO_FORMAT_ENCODED)
 @@ -3900,6 +3913,15 @@
    GST_DEBUG_OBJECT (v4l2object->dbg_obj, "Desired colorspace is %d:%d:%d:%d",
        colorspace, range, matrix, transfer);
@@ -294,10 +840,10 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.c gst-plugins-good-1.
            if (!gst_buffer_pool_is_active (obj_pool))
              pool = gst_object_ref (obj_pool);
  
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.h gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.h
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.h	2024-12-13 15:23:06.601401623 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.h	2024-12-13 15:27:35.771950794 +0800
-@@ -229,6 +229,12 @@
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2object.h gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.h
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2object.h	2025-02-12 16:50:58.364614595 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2object.h	2025-02-12 16:53:59.348053136 +0800
+@@ -229,6 +229,13 @@
     * on slow USB firmwares. When this is set, gst_v4l2_set_format() will modify
     * the caps to reflect what was negotiated during fixation */
    gboolean skip_try_fmt_probes;
@@ -307,10 +853,11 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.h gst-plugins-good-1.
 +  int exp_fd[VIDEO_MAX_FRAME+1];
 +
 +  gboolean remap_sync;
++  gboolean disable_capture_copy;
  };
  
  struct _GstV4l2ObjectClassHelper {
-@@ -253,7 +259,8 @@
+@@ -253,7 +260,8 @@
      PROP_CAPTURE_IO_MODE,     \
      PROP_EXTRA_CONTROLS,      \
      PROP_PIXEL_ASPECT_RATIO,  \
@@ -320,20 +867,21 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2object.h gst-plugins-good-1.
  
  /* create/destroy */
  GstV4l2Object*  gst_v4l2_object_new       (GstElement * element,
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videodec.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videodec.c
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videodec.c	2024-12-13 15:23:06.601401623 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videodec.c	2024-12-13 15:27:59.757064021 +0800
-@@ -58,8 +58,8 @@
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2videodec.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videodec.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2videodec.c	2025-02-12 16:50:58.364614595 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videodec.c	2025-02-14 10:43:23.850319749 +0800
+@@ -58,8 +58,9 @@
  enum
  {
    PROP_0,
 +  V4L2_STD_OBJECT_PROPS,
    PROP_V4L2_EXTERN_BUFFER,
 -  V4L2_STD_OBJECT_PROPS
++  PROP_CAPTURE_COPY_DISABLE,
  };
  
  #define gst_v4l2_video_dec_parent_class parent_class
-@@ -82,10 +82,13 @@
+@@ -82,10 +83,15 @@
        }
        break;
      case PROP_V4L2_EXTERN_BUFFER:
@@ -344,6 +892,8 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videodec.c gst-plugins-good-
 +      self->use_extern_buffer = g_value_get_boolean(value);
 +      self->v4l2capture->extern_buffer = self->use_extern_buffer;
 +      break;
++    case PROP_CAPTURE_COPY_DISABLE:
++      self->v4l2capture->disable_capture_copy = g_value_get_boolean(value);
 +    case PROP_REMAP_SYNC:
 +      self->v4l2capture->remap_sync = g_value_get_boolean (value);
 +      self->v4l2output->remap_sync = g_value_get_boolean (value);
@@ -351,28 +901,46 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videodec.c gst-plugins-good-
  
        /* By default, only set on output */
      default:
-@@ -1292,8 +1295,7 @@
+@@ -1292,8 +1298,8 @@
        V4L2_BUF_TYPE_VIDEO_CAPTURE, klass->default_device,
        gst_v4l2_get_input, gst_v4l2_set_input, NULL);
  
 -  if(self->v4l2capture)
 -    self->v4l2capture->extern_buffer = self->use_extern_buffer;
 +  self->v4l2capture->extern_buffer = self->use_extern_buffer;
++  self->v4l2capture->disable_capture_copy = FALSE;
  }
  
  static void
-diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videoenc.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videoenc.c
---- gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videoenc.c	2024-12-13 15:23:12.225384033 +0800
-+++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videoenc.c	2024-12-13 15:28:21.174523211 +0800
-@@ -53,6 +53,7 @@
+@@ -1351,6 +1357,12 @@
+             FALSE,
+             G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
+ 
++  g_object_class_install_property (gobject_class, PROP_CAPTURE_COPY_DISABLE,
++        g_param_spec_boolean ("disable-capture-copy", "Disable Capture Copy",
++            "Push the capture buffer back directly instead copy it to the CPU buffer",
++            FALSE,
++            G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
++
+   gst_v4l2_object_install_m2m_properties_helper (gobject_class);
+ }
+ 
+diff -uNr gst-plugins-good-1.22.9/sys/v4l2/gstv4l2videoenc.c gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videoenc.c
+--- gst-plugins-good-1.22.9/sys/v4l2/gstv4l2videoenc.c	2025-02-12 16:53:40.364112029 +0800
++++ gst-plugins-good-1.22.9.b/sys/v4l2/gstv4l2videoenc.c	2025-03-26 15:22:29.940400149 +0800
+@@ -54,8 +54,11 @@
  {
    PROP_0,
    V4L2_STD_OBJECT_PROPS,
 +  PROP_USE_DMA_COPY,
  };
  
++#define PROP_USE_DMA_COPY_DEFAULT FALSE
++
  #define gst_v4l2_video_enc_parent_class parent_class
-@@ -72,6 +73,13 @@
+ G_DEFINE_ABSTRACT_TYPE (GstV4l2VideoEnc, gst_v4l2_video_enc,
+     GST_TYPE_VIDEO_ENCODER);
+@@ -73,6 +76,13 @@
          G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
        }
        break;
@@ -386,7 +954,7 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videoenc.c gst-plugins-good-
  
        /* By default, only set on output */
      default:
-@@ -614,7 +622,7 @@
+@@ -615,7 +625,7 @@
  
    state = gst_video_encoder_get_output_state (encoder);
    s = gst_caps_get_structure (state->caps, 0);
@@ -395,39 +963,36 @@ diff -uNr gst-plugins-good-1.22.9.a/sys/v4l2/gstv4l2videoenc.c gst-plugins-good-
  
    if (codec->profile_cid)
      gst_structure_set (s, "profile", G_TYPE_STRING, ctx.profile, NULL);
-@@ -730,14 +738,14 @@
- 	}
+@@ -895,10 +905,11 @@
+           gst_object_unref (pool);
+         goto activate_failed;
+       }
+-      if (pool)
+-        gst_object_unref (pool);
+     }
  
-     do{
--	  frames = gst_video_encoder_get_frames(encoder);	
-+	  frames = gst_video_encoder_get_frames(encoder);
- 	  if(!frames && do_sleep)
- 	  	g_usleep(do_sleep);
-     }while(!frames && try_cnt--);
- 
- 	if(frames){
- 	  GstVideoCodecFrame *head = frames->data;
--	  self->frame_num = head->system_frame_number;	  
-+	  self->frame_num = head->system_frame_number;
- 
- 	  g_list_foreach (frames, (GFunc) gst_video_codec_frame_unref, NULL);
- 	  g_list_free (frames);
-@@ -1177,6 +1185,7 @@
++    if (pool)
++      gst_object_unref (pool);
++
+     {
+       GstBufferPool *cpool =
+           gst_v4l2_object_get_buffer_pool (self->v4l2capture);
+@@ -1202,6 +1213,7 @@
        gst_v4l2_get_output, gst_v4l2_set_output, NULL);
    self->v4l2output->no_initial_format = TRUE;
    self->v4l2output->keep_aspect = FALSE;
-+  self->v4l2output->use_dma_copy = TRUE;
++  self->v4l2output->use_dma_copy = PROP_USE_DMA_COPY_DEFAULT;
  
    self->v4l2capture = gst_v4l2_object_new (GST_ELEMENT (self),
        GST_OBJECT (GST_VIDEO_ENCODER_SRC_PAD (self)),
-@@ -1236,6 +1245,12 @@
+@@ -1260,6 +1272,12 @@
    element_class->change_state =
        GST_DEBUG_FUNCPTR (gst_v4l2_video_enc_change_state);
  
 +  g_object_class_install_property (gobject_class, PROP_USE_DMA_COPY,
 +    g_param_spec_boolean ("use-dma-copy", "Use DMA copy",
 +        "Use dma copy when input buffer from DMA, only for encode",
-+        TRUE,
++        PROP_USE_DMA_COPY_DEFAULT,
 +        G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
 +
    gst_v4l2_object_install_m2m_properties_helper (gobject_class);
