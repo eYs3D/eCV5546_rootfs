@@ -49,6 +49,16 @@ if [ "$1" = "EMMC" ]; then
 		mkfs.ext4 $OVERLAY
 		check_error
 	else
+		# Read the MENDER_OTA_INTEGRATION config from U-Boot's defconfig
+		DEFCONFIG_FILE="../../boot/uboot/.config"
+		if grep -q "^CONFIG_MENDER_OTA_INTEGRATION=y" "$DEFCONFIG_FILE"; then
+			echo "!!!! Mender OTA integration is enabled - copy uImage and dtb to /boot/ !!!! "
+			cp -vf ../kernel/arch/arm64/boot/uImage $WORK_DIR/boot/
+			cp -vf ../kernel/dtb $WORK_DIR/boot/
+		else
+			echo "!!!! Mender OTA integration is disable !!!!"
+		fi
+
 		# Assume 40% +20MB overhead for creating ext4 fs.
 		diskdir_sz=$((diskdir_sz*14/10))
 		EXT_SIZE=$((diskdir_sz/1024/1024+20))

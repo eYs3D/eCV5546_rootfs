@@ -298,7 +298,191 @@ elif [ "${ROOTFS_CONTENT:0:6}" = "UBUNTU" ]; then
 		fi
 	fi
 
-	find ${rootfs_common_dir}/ -maxdepth 1 ! -name 'README.md' ! -path ${rootfs_common_dir}/ -exec cp -av {} "$DISKOUT" \;
+	# === Check CONFIG_MENDER_OTA_INTEGRATION from uboot config ===
+	UBOOT_CONFIG_FILE="../../../boot/uboot/.config"
+	USE_AB_PARTITION=false
+	if [ -f "$UBOOT_CONFIG_FILE" ]; then
+		if grep -q "^CONFIG_MENDER_OTA_INTEGRATION=y" "$UBOOT_CONFIG_FILE"; then
+			echo "[INFO] CONFIG_MENDER_OTA_INTEGRATION is enabled in uboot config"
+			USE_AB_PARTITION=true
+		else
+			echo "[INFO] CONFIG_MENDER_OTA_INTEGRATION is disabled in uboot config"
+		fi
+	else
+		echo "[WARNING] Cannot find uboot config file at: $UBOOT_CONFIG_FILE"
+	fi
+	
+	if [ "$USE_AB_PARTITION" = "true"  ]; then
+		# --- SETUP MENDER CONFIG AND INSTALLATION ---
+		echo "Mender configuration start"
+		# === copy fw_printenv and fw_env.config
+		if [ ! -d "${DISKOUT}/usr/sbin" ]; then
+			mkdir -p "${DISKOUT}/usr/sbin"
+		fi
+				
+		uboot_tool_dir=${rootfs_prebuilt_dir}/uboot_fw_tool
+		ubootFW="fw_printenv"
+		ubootConfig="fw_env.config"
+
+		if [ ! -f "$uboot_tool_dir/$ubootFW" ]; then
+			echo "ERROR: $uboot_tool_dir/$ubootFW not found"
+			exit 1
+		else
+			cp "$uboot_tool_dir/$ubootFW" "$DISKOUT/usr/sbin"
+			chmod +x "${DISKOUT}/usr/sbin/$ubootFW"
+			ln -sf /usr/sbin/$ubootFW "${DISKOUT}/usr/sbin/fw_setenv"
+			cp "$uboot_tool_dir/$ubootConfig" "$DISKOUT/etc/"
+		fi
+
+		# === Setup mender directory initialization service ===
+		echo "Setting up mender directory initialization service..."
+
+		# Create the script
+		cat > "${DISKOUT}/usr/local/bin/mender_dir_setup.sh" << 'EOF'
+#!/bin/sh
+
+while [ ! -d "/data" ] || ! mountpoint -q "/data"; do
+    sleep 1
+done
+
+
+MENDER_DIRS="mender mender-configure mender-monitor"
+
+for dir in $MENDER_DIRS; do
+    if [ ! -d "/data/$dir" ]; then
+        install -d -m 755 "/data/$dir"
+
+        if [ "$dir" = "mender" ]; then
+            if [ ! -f "/data/$dir/device_type" ]; then
+                echo "device_type=XINK" > "/data/$dir/device_type"
+                chmod 644 "/data/$dir/device_type"
+            fi
+        fi
+    fi
+
+    if [ -d "/var/lib/$dir" ] && [ ! -L "/var/lib/$dir" ]; then
+        rm -rf "/var/lib/$dir"
+    fi
+
+    ln -sfT "/data/$dir" "/var/lib/$dir"
+done
+
+chown -R root:root /data/mender* /var/lib/mender*
+chmod -R 755 /data/mender*
+EOF
+
+		# Set script permissions
+		chmod 755 "${DISKOUT}/usr/local/bin/mender_dir_setup.sh"
+
+		# Create systemd service file
+		cat > "${DISKOUT}/etc/systemd/system/mender-dir-setup.service" << 'EOF'
+[Unit]
+Description=Mender Directory Setup Service
+DefaultDependencies=no
+After=local-fs.target
+Before=mender-client.service mender-authd.service
+ConditionPathExists=/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/mender_dir_setup.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+		# Set service file permissions
+		chmod 644 "${DISKOUT}/etc/systemd/system/mender-dir-setup.service"
+
+		# Enable the service in chroot
+		chroot "${DISKOUT}" systemctl enable mender-dir-setup.service
+
+		# *** config mender client and /data/mender ***
+
+		SERVER_IP="192.168.4.40"  # Replace with your actual server IP
+
+		DEVICE_TYPE="XINK"
+
+		FSTAB_CONF="${DISKOUT}/etc/fstab"
+		echo "[INFO] Configuring fstab"
+
+		if [ -f "$FSTAB_CONF" ]; then
+			cp "$FSTAB_CONF" "${FSTAB_CONF}.bak"
+			sed -i '$a\/dev/mmcblk0p9\t/data\tauto\tdefaults,x-systemd.growfs\t0\t0' "$FSTAB_CONF"
+		fi
+
+		# Create device type file
+		mkdir -p "${DISKOUT}/etc/mender"
+
+		DEVICE_CONFIG="${DISKOUT}/etc/mender/device_type"
+
+		cat >> "$DEVICE_CONFIG" << EOF
+device_type=$DEVICE_TYPE
+EOF
+
+		# Create configuration file
+		rm "${DISKOUT}/etc/mender/mender.conf"
+		MENDER_CONFIG="${DISKOUT}/etc/mender/mender.conf"
+		cat >> "$MENDER_CONFIG" << EOF
+{
+"ServerURL": "https://$SERVER_IP",
+"DeviceType": "$DEVICE_TYPE",
+"TenantToken": "",
+"ClientProtocol": "https",
+"SkipVerify": true,
+"RootfsPartA": "/dev/mmcblk0p10",
+"RootfsPartB": "/dev/mmcblk0p11",
+"InventoryPollIntervalSeconds": 30,
+"RetryPollIntervalSeconds": 30,
+"RetryPollCount": 15,
+"UpdatePollIntervalSeconds": 30
+}
+EOF
+
+		echo "Mender configuration completed!"
+
+		# --- CHROOT SETUP AND MENDER INSTALLATION ---
+		# 1. Setup DNS for chroot
+		echo "Setting up DNS for chroot..."
+		rm -f "${DISKOUT}/etc/resolv.conf"
+		cp /etc/resolv.conf "${DISKOUT}/etc/"
+
+		# 2. Create essential device nodes
+		#echo "Creating essential device nodes..."
+		mknod -m 666 "${DISKOUT}/dev/null" c 1 3
+
+		# 3. Configure locales
+		echo "Configuring locales..."
+		chroot "${DISKOUT}" locale-gen en_US.UTF-8
+
+		# 4. Install Mender
+		echo "Installing Mender..."
+		chmod +x get-mender.sh
+		cp get-mender.sh "$DISKOUT/tmp/"
+		chroot "$DISKOUT" /tmp/get-mender.sh mender-client4
+
+		# 5. Install additional mender update modules
+		# deb https://github.com/mendersoftware/mender-update-modules/tree/master/deb
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/deb/module/deb && chmod +x "$DISKOUT/usr/share/mender/modules/v3/deb"
+		# dirty https://github.com/mendersoftware/mender-update-modules/tree/master/dirty
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/dirty/module/dirty && chmod +x "$DISKOUT/usr/share/mender/modules/v3/dirty"
+		# dir overlay https://github.com/mendersoftware/mender-update-modules/tree/master/dir-overlay
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/dir-overlay/module/dir-overlay && chmod +x "$DISKOUT/usr/share/mender/modules/v3/dir-overlay"
+		# install snap https://github.com/mendersoftware/mender-update-modules/tree/master/install_snap
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/install_snap/module/install_snap && chmod +x "$DISKOUT/usr/share/mender/modules/v3/install_snap"
+		# rootfs version check https://github.com/mendersoftware/mender-update-modules/tree/master/rootfs-version-check
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/rootfs-version-check/module/rootfs-version-check && chmod +x "$DISKOUT/usr/share/mender/modules/v3/rootfs-version-check"
+		# script https://github.com/mendersoftware/mender-update-modules/tree/master/script
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/script/module/script && chmod +x "$DISKOUT/usr/share/mender/modules/v3/script"
+		# swu https://github.com/mendersoftware/mender-update-modules/tree/master/swu
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/swu/module/swu && chmod +x "$DISKOUT/usr/share/mender/modules/v3/swu"
+		# reboot https://github.com/mendersoftware/mender-update-modules/tree/master/reboot
+		mkdir -p "$DISKOUT/usr/share/mender/modules/v3" && wget -P "$DISKOUT/usr/share/mender/modules/v3" https://raw.githubusercontent.com/mendersoftware/mender-update-modules/master/reboot/module/reboot && chmod +x "$DISKOUT/usr/share/mender/modules/v3/reboot"
+		# --- END CHROOT SETUP ---
+	fi
+
+    find ${rootfs_common_dir}/ -maxdepth 1 ! -name 'README.md' ! -path ${rootfs_common_dir}/ -exec cp -a {} "$DISKOUT" \;
 	if [ -d "${rootfs_src_dir}/disk-private" ]; then
 		cp -av "${rootfs_src_dir}/disk-private/"* "$DISKOUT"
 	fi
