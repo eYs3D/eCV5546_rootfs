@@ -369,6 +369,15 @@ done
 
 chown -R root:root /data/mender* /var/lib/mender*
 chmod -R 755 /data/mender*
+
+DEVICE_TYPE_FILE="/data/mender/device_type"
+TARGET_CONTENT="device_type=XINK"
+
+if [ ! -f "$DEVICE_TYPE_FILE" ] || ! grep -q "^${TARGET_CONTENT}$" "$DEVICE_TYPE_FILE"; then
+    echo "$TARGET_CONTENT" > "$DEVICE_TYPE_FILE"
+    chmod 644 "$DEVICE_TYPE_FILE"
+    chown root:root "$DEVICE_TYPE_FILE"
+fi
 EOF
 
 		# Set script permissions
