@@ -405,7 +405,9 @@ EOF
 		chmod 644 "${DISKOUT}/etc/systemd/system/mender-dir-setup.service"
 
 		# Enable the service in chroot
-		chroot "${DISKOUT}" systemctl enable mender-dir-setup.service
+		# chroot "${DISKOUT}" systemctl enable mender-dir-setup.service
+		mkdir -p "${DISKOUT}/etc/systemd/system/multi-user.target.wants"
+		ln -sf /etc/systemd/system/mender-dir-setup.service "${DISKOUT}/etc/systemd/system/multi-user.target.wants/mender-dir-setup.service"
 
 		# *** config mender client and /data/mender ***
 
@@ -431,7 +433,11 @@ device_type=$DEVICE_TYPE
 EOF
 
 		# Create configuration file
-		rm "${DISKOUT}/etc/mender/mender.conf"
+		if [ -f "${DISKOUT}/etc/mender/mender.conf" ]; then
+			echo "Removing existing mender.conf..."
+			rm "${DISKOUT}/etc/mender/mender.conf"
+		fi
+
 		MENDER_CONFIG="${DISKOUT}/etc/mender/mender.conf"
 		cat >> "$MENDER_CONFIG" << EOF
 {

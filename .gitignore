@@ -7,3 +7,9 @@ disk/
 extra/
 busybox-*/
 initramfs/.tmp/
+initramfs/yocto/bitbake-cookerdaemon.log
+initramfs/yocto/*/conf/templateconf.cfg
+initramfs/yocto/*/conf/conf-notes.txt
+initramfs/yocto/locked-sigs.inc
+initramfs/yocto/rootfs_path
+initramfs/yocto/bbfile.md5*
