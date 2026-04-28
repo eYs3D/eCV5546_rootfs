@@ -4,12 +4,12 @@ HOSTNAME='ubuntu'
 DEFAULT_USER='eys3d'
 DEFAULT_PASSWORD='eys3d'
 
-UBUNTU_RELEASE='20.04'
-UBUNTU_BASE_RELEASE='20.04.5'
-UBUNTU_CODENAME='focal'
+UBUNTU_RELEASE='24.04'
+UBUNTU_BASE_RELEASE='24.04.3'
+UBUNTU_CODENAME='noble'
 
-# server ,mate or xfce
-UBUNTU_TYPE='server'
+# minimal, base, server, mate or xfce
+UBUNTU_TYPE='minimal'
 
 UBUNTU_APT_SOURCE_URL='http://ports.ubuntu.com'
 
@@ -27,6 +27,13 @@ deb ${UBUNTU_APT_SOURCE_URL}/ubuntu-ports/ ${UBUNTU_CODENAME}-updates main restr
 #UBUNTU_MATE_XFCE_OEM_CONFIG='true'
 UBUNTU_APT_SOURCE_RESTORE_FROM_BACKUP='true'
 UBUNTU_APT_SOURCES_LIST_FILE="${UBUNTU_ROOTFS}/etc/apt/sources.list"
+UBUNTU_MINIMAL_PACKAGES="\
+ubuntu-standard ubuntu-minimal \
+openssh-server \
+iputils-ping \
+curl net-tools \
+network-manager \
+"
 UBUNTU_SERVER_PACKAGES="ubuntu-standard ubuntu-minimal ubuntu-server \
 curl net-tools iputils-ping net-tools network-manager openssh-server \
 xterm \
@@ -100,7 +107,9 @@ rootfs_install()
     export LANG=C
     chroot ${UBUNTU_ROOTFS} /bin/bash -c "apt update"
     chroot ${UBUNTU_ROOTFS} /bin/bash -c "apt -y upgrade"
-    if [ "$UBUNTU_TYPE" == "mate" ]; then
+    if [ "$UBUNTU_TYPE" == "minimal" ]; then
+        chroot ${UBUNTU_ROOTFS} /bin/bash -c "apt-get install -y ${UBUNTU_MINIMAL_PACKAGES}"
+    elif [ "$UBUNTU_TYPE" == "mate" ]; then
         chroot ${UBUNTU_ROOTFS} /bin/bash -c "apt-get install -y ${UBUNTU_MATE_PACKAGES}"
     elif [ "$UBUNTU_TYPE" == "xfce" ]; then
         chroot ${UBUNTU_ROOTFS} /bin/bash -c "apt-get install -y ${UBUNTU_XFCE_PACKAGES}"
@@ -115,7 +124,7 @@ rootfs_config()
     chroot ${UBUNTU_ROOTFS} /bin/bash -c "locale-gen en_US en_US.UTF-8"
     chroot ${UBUNTU_ROOTFS} /bin/bash -c "update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8"
     if [ -n "$DEFAULT_USER" ]; then
-            if [ "$UBUNTU_TYPE" == "server" ] || [ -z "$UBUNTU_MATE_XFCE_OEM_CONFIG" ]; then
+            if [ "$UBUNTU_TYPE" == "minimal" ] || [ "$UBUNTU_TYPE" == "server" ] || [ -z "$UBUNTU_MATE_XFCE_OEM_CONFIG" ]; then
                 chroot ${UBUNTU_ROOTFS} /bin/bash -c "adduser $DEFAULT_USER --gecos \"\" --disabled-password"
                 chroot ${UBUNTU_ROOTFS} /bin/bash -c "echo \"${DEFAULT_USER}:${DEFAULT_PASSWORD}\"|chpasswd"
             fi
